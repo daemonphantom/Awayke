@@ -5,12 +5,22 @@
 
 import AppKit
 import ServiceManagement
+import UserNotifications
 
 final class AppDelegate: NSObject, NSApplicationDelegate {
     private var statusItem: NSStatusItem?
     private let powerManager = PowerManager()
     private let helper = HelperManager.shared
     private let displayKeeper = DisplayWakeKeeper()
+    private let batteryMonitor = BatteryMonitor()
+
+    private static let batteryLimitKey = "BatteryLimit"
+
+    /// Battery percentage at which Awayke turns itself off. 0 = disabled.
+    private var batteryLimit: Int {
+        get { UserDefaults.standard.integer(forKey: Self.batteryLimitKey) }
+        set { UserDefaults.standard.set(newValue, forKey: Self.batteryLimitKey) }
+    }
 
     private var isActive: Bool = false {
         didSet {
@@ -44,6 +54,60 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         if helper.isUsable {
             powerManager.disableSleep(false) { _ in }
         }
+
+        batteryMonitor.onChange = { [weak self] in
+            self?.enforceBatteryLimit()
+        }
+        batteryMonitor.start()
+
+        UNUserNotificationCenter.current()
+            .requestAuthorization(options: [.alert, .sound]) { _, _ in }
+    }
+
+    /// Turns Awayke off when the battery drains to the configured limit.
+    /// Only acts while discharging, so a plugged-in Mac sitting below the
+    /// limit isn't affected.
+    private func enforceBatteryLimit() {
+        guard isActive, batteryLimit > 0,
+              let status = BatteryMonitor.currentStatus(),
+              status.onBattery, status.percent <= batteryLimit else { return }
+
+        let percent = status.percent
+        powerManager.disableSleep(false) { [weak self] result in
+            DispatchQueue.main.async {
+                guard let self, case .success = result else { return }
+                self.isActive = false
+                self.postBatteryLimitNotification(percent: percent)
+            }
+        }
+    }
+
+    private func postBatteryLimitNotification(percent: Int) {
+        let title = "Awayke turned off"
+        let body = "Battery reached \(percent)%, at or below your \(batteryLimit)% limit. Sleep is enabled again."
+
+        // Native notifications require a valid signing identity; ad-hoc
+        // builds are rejected by Notification Center. Try native first,
+        // fall back to osascript (shows as "Script Editor") otherwise.
+        UNUserNotificationCenter.current().requestAuthorization(options: [.alert, .sound]) { granted, _ in
+            if granted {
+                let content = UNMutableNotificationContent()
+                content.title = title
+                content.body = body
+                content.sound = .default
+                let request = UNNotificationRequest(
+                    identifier: "awayke.batteryLimit",
+                    content: content,
+                    trigger: nil
+                )
+                UNUserNotificationCenter.current().add(request)
+            } else {
+                DispatchQueue.main.async {
+                    NotificationBanner.show(title: title, body: body)
+                    NSSound.beep()
+                }
+            }
+        }
     }
 
     func applicationShouldTerminate(_ sender: NSApplication) -> NSApplication.TerminateReply {
@@ -76,7 +140,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             DispatchQueue.main.async {
                 guard let self else { return }
                 switch result {
-                case .success: self.isActive = target
+                case .success:
+                    self.isActive = target
+                    if target { self.enforceBatteryLimit() }
                 case .failure(let error): self.presentError(error)
                 }
             }
@@ -92,6 +158,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
         menu.addItem(.separator())
         menu.addItem(NSMenuItem(title: isActive ? "Turn Off" : "Turn On", action: #selector(menuToggle), keyEquivalent: ""))
+
+        menu.addItem(.separator())
+        menu.addItem(batteryLimitMenuItem())
 
         if let helperRow = helperStatusMenuItem() {
             menu.addItem(.separator())
@@ -109,6 +178,39 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         statusItem?.menu = menu
         statusItem?.button?.performClick(nil)
         statusItem?.menu = nil
+    }
+
+    private func batteryLimitMenuItem() -> NSMenuItem {
+        let submenu = NSMenu()
+
+        let offItem = NSMenuItem(title: "Never", action: #selector(menuSetBatteryLimit(_:)), keyEquivalent: "")
+        offItem.tag = 0
+        offItem.target = self
+        offItem.state = batteryLimit == 0 ? .on : .off
+        submenu.addItem(offItem)
+        submenu.addItem(.separator())
+
+        for percent in stride(from: 10, through: 90, by: 10) {
+            let item = NSMenuItem(title: "\(percent)%", action: #selector(menuSetBatteryLimit(_:)), keyEquivalent: "")
+            item.tag = percent
+            item.target = self
+            item.state = batteryLimit == percent ? .on : .off
+            submenu.addItem(item)
+        }
+
+        let title = batteryLimit > 0 ? "Turn Off at Battery Level (\(batteryLimit)%)" : "Turn Off at Battery Level"
+        let root = NSMenuItem(title: title, action: nil, keyEquivalent: "")
+        root.submenu = submenu
+        return root
+    }
+
+    @objc private func menuSetBatteryLimit(_ sender: NSMenuItem) {
+        batteryLimit = sender.tag
+        if batteryLimit > 0 {
+            UNUserNotificationCenter.current()
+                .requestAuthorization(options: [.alert, .sound]) { _, _ in }
+        }
+        enforceBatteryLimit()
     }
 
     private func helperStatusMenuItem() -> NSMenuItem? {
