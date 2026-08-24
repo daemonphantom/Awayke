@@ -5,7 +5,7 @@
 <h1 align="center"><a href="https://daemonphantom.github.io/Awayke/">Awayke</a></h1>
 
 <p align="center">
-  Close the lid. Keep your Mac awayke.
+  Keep Your Mac Awayke With the Lid Closed
 </p>
 
 <p align="center">
