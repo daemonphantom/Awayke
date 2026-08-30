@@ -17,6 +17,10 @@ import IOKit.pwr_mgt
 private let clamshellStateChangeMessage =
     (UInt32(0x38) << 26) | (UInt32(13) << 14) | UInt32(0x100)
 
+// IOPM.h documents the clamshell message as carrying the state in its message
+// argument: "Check bits 0 and 1 using kClamshellStateBit & kClamshellSleepBit".
+private let clamshellStateBit = UInt(1 << 0)
+
 final class LidMonitor {
 
     /// Called on the main queue whenever the physical lid state changes.
@@ -28,18 +32,21 @@ final class LidMonitor {
     private var notificationPort: IONotificationPortRef?
     private var notifier: io_object_t = IO_OBJECT_NULL
 
-    func start() {
-        guard notificationPort == nil else { return }
+    /// Returns false when the clamshell notification could not be registered.
+    /// No lid change is reported at all in that case, so a caller that relies
+    /// on lid events needs to know.
+    func start() -> Bool {
+        guard notificationPort == nil else { return true }
 
         let service = IOServiceGetMatchingService(
             kIOMainPortDefault,
             IOServiceMatching("IOPMrootDomain")
         )
-        guard service != IO_OBJECT_NULL else { return }
+        guard service != IO_OBJECT_NULL else { return false }
 
         guard let port = IONotificationPortCreate(kIOMainPortDefault) else {
             IOObjectRelease(service)
-            return
+            return false
         }
 
         rootDomain = service
@@ -51,13 +58,18 @@ final class LidMonitor {
             port,
             service,
             kIOGeneralInterest,
-            { context, _, messageType, _ in
+            { context, _, messageType, messageArgument in
                 guard messageType == clamshellStateChangeMessage,
                       let context else { return }
                 let monitor = Unmanaged<LidMonitor>
                     .fromOpaque(context)
                     .takeUnretainedValue()
-                monitor.emitCurrentState()
+                // The lid state travels with the message. Reading the registry
+                // here would instead report the state at delivery time, which
+                // drops a close/open pair that queues up while the main queue
+                // is busy.
+                let closed = (UInt(bitPattern: messageArgument) & clamshellStateBit) != 0
+                monitor.emit(closed: closed)
             },
             context,
             &notifier
@@ -65,10 +77,13 @@ final class LidMonitor {
 
         guard result == kIOReturnSuccess else {
             stop()
-            return
+            return false
         }
 
-        emitCurrentState()
+        if let closed = readClamshellState() {
+            emit(closed: closed)
+        }
+        return true
     }
 
     func stop() {
@@ -91,18 +106,22 @@ final class LidMonitor {
         stop()
     }
 
-    private func emitCurrentState() {
+    private func emit(closed: Bool) {
+        guard closed != isClosed else { return }
+        isClosed = closed
+        onChange?(closed)
+    }
+
+    /// Only used for the initial reading; later states arrive with the message.
+    private func readClamshellState() -> Bool? {
         guard rootDomain != IO_OBJECT_NULL,
               let property = IORegistryEntryCreateCFProperty(
                 rootDomain,
                 kAppleClamshellStateKey as CFString,
                 kCFAllocatorDefault,
                 0
-              )?.takeRetainedValue() as? NSNumber else { return }
+              )?.takeRetainedValue() as? NSNumber else { return nil }
 
-        let closed = property.boolValue
-        guard closed != isClosed else { return }
-        isClosed = closed
-        onChange?(closed)
+        return property.boolValue
     }
 }

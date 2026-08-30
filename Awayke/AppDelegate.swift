@@ -104,7 +104,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                 self.endSession(reason: .lidReopened)
             }
         }
-        lidMonitor.start()
+        if !lidMonitor.start() {
+            NSLog("Awayke: lid monitoring unavailable; until-lid-reopens sessions cannot end on their own.")
+        }
     }
 
     func applicationShouldTerminate(_ sender: NSApplication) -> NSApplication.TerminateReply {
